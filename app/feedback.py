@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Feedback orchestration: provider routing, caching, and sentinel validation.
 
 This is the main business logic module that ties together:

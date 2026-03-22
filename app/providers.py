@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Dual-provider LLM integration with automatic fallback.
 
 Architecture:
@@ -82,7 +84,7 @@ class LLMProvider(ABC):
 class AnthropicProvider(LLMProvider):
     """Anthropic Claude provider using native JSON mode + Pydantic validation."""
 
-    def __init__(self, model: str = "claude-3-5-haiku-latest"):
+    def __init__(self, model: str = "claude-haiku-4-5"):
         self.model = model
         self._client = None
 
