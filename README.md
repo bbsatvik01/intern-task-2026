@@ -1,6 +1,6 @@
 # Language Feedback API
 
-> A production-grade, LLM-powered language correction and feedback API for language learners. Built with FastAPI, Anthropic Claude Haiku 4.5, and OpenAI GPT-4o-mini — designed for real-world deployment in [Pangea Chat](https://pangea.chat)'s language learning ecosystem.
+> A production-grade, LLM-powered language correction and feedback API for language learners. Built with FastAPI, OpenAI GPT-4.1 nano, and Anthropic Claude Haiku 4.5 — designed for real-world deployment in [Pangea Chat](https://pangea.chat)'s language learning ecosystem.
 
 ## Architecture
 
@@ -14,9 +14,9 @@ POST /feedback
   │     └─► Return cached response (0ms, saves $$$)
   │
   ├─► LLM Provider Router (dual-provider with auto-fallback)
-  │     ├─► Primary: Anthropic Claude Haiku 4.5
+  │     ├─► Primary: OpenAI GPT-4.1 nano (cheapest, 10x less than alternatives)
   │     │     └─► Retry (2x, exponential backoff + jitter, TRANSIENT errors only)
-  │     └─► Fallback: OpenAI GPT-4o-mini
+  │     └─► Fallback: Anthropic Claude Haiku 4.5 (higher quality)
   │           └─► Retry (2x, exponential backoff + jitter, TRANSIENT errors only)
   │
   ├─► Sentinel Validation (deterministic, no LLM call)
@@ -37,13 +37,13 @@ POST /feedback
 
 **Solution**: Automatic failover between two complementary providers:
 
-| | Anthropic Claude Haiku 4.5 (Primary) | OpenAI GPT-4o-mini (Fallback) |
+| | OpenAI GPT-4.1 nano (Primary) | Anthropic Claude Haiku 4.5 (Fallback) |
 |---|---|---|
-| **Strength** | Superior multilingual accuracy | Best structured output support |
-| **Input cost** | $1.00/1M tokens | $0.15/1M tokens |
-| **Output cost** | $5.00/1M tokens | $0.60/1M tokens |
-| **Latency** | ~2-4s | ~1-3s |
-| **Why chosen** | Natural, learner-friendly explanations across scripts | 6x cheaper, `.parse()` guarantees valid JSON |
+| **Strength** | Cheapest, fastest, strong structured output | Superior multilingual accuracy |
+| **Input cost** | **$0.10/1M tokens** | $1.00/1M tokens |
+| **Output cost** | **$0.40/1M tokens** | $5.00/1M tokens |
+| **Latency** | ~1-2s | ~2-4s |
+| **Why chosen** | 10x cheaper than alternatives, `.parse()` guarantees valid JSON | Natural, learner-friendly explanations across scripts |
 
 **Key design**: The retry logic **only retries transient errors** (rate limits, timeouts, connection failures). Validation errors, auth failures, and schema mismatches fail immediately — retrying them wastes time and tokens. This is a critical production pattern often missed in prototypes.
 
@@ -287,14 +287,14 @@ The API supports **any language** that the underlying LLM models support (100+ l
 
 ## Cost Analysis
 
-| Scenario | Claude Haiku 4.5 | GPT-4o-mini | With Cache (50% hit rate) |
-|----------|-------------------|-------------|--------------------------|
-| Per request | ~$0.003 | ~$0.0005 | ~$0.0015 |
-| 1K requests/day | ~$3.00/day | ~$0.50/day | ~$1.50/day |
-| 10K requests/day | ~$30/day | ~$5/day | ~$15/day |
-| Monthly (10K/day) | ~$900/mo | ~$150/mo | ~$450/mo |
+| Scenario | GPT-4.1 nano (Primary) | Claude Haiku 4.5 (Fallback) | With Cache (50% hit rate) |
+|----------|------------------------|---------------------------|---------------------------|
+| Per request | **~$0.0002** | ~$0.003 | ~$0.0001 |
+| 1K requests/day | **~$0.20/day** | ~$3.00/day | ~$0.10/day |
+| 10K requests/day | **~$2.00/day** | ~$30/day | ~$1.00/day |
+| Monthly (10K/day) | **~$60/mo** | ~$900/mo | ~$30/mo |
 
-In a classroom of 30 students submitting 10 sentences each per session, that's 300 requests — approximately **$0.90** with Claude or **$0.15** with GPT-4o-mini per class session.
+In a classroom of 30 students submitting 10 sentences each per session, that's 300 requests — approximately **$0.06** with GPT-4.1 nano per class session. With caching, even less.
 
 ## Limitations & Future Improvements
 

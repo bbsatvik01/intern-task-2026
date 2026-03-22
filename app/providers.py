@@ -3,8 +3,8 @@ from __future__ import annotations
 """Dual-provider LLM integration with automatic fallback.
 
 Architecture:
-- Primary: Anthropic Claude 3.5 Haiku (best multilingual accuracy, natural explanations)
-- Fallback: OpenAI GPT-4o-mini (6x cheaper, fast, strong structured output)
+- Primary: OpenAI GPT-4.1 nano (cheapest, fast, strong structured output)
+- Fallback: Anthropic Claude Haiku 4.5 (higher quality, natural explanations)
 
 Both providers use their SDK's native structured output features:
 - Anthropic: messages.create() with JSON mode + Pydantic validation
@@ -165,7 +165,7 @@ class AnthropicProvider(LLMProvider):
 class OpenAIProvider(LLMProvider):
     """OpenAI provider using chat.completions.parse() with Pydantic structured output."""
 
-    def __init__(self, model: str = "gpt-4o-mini"):
+    def __init__(self, model: str = "gpt-4.1-nano"):
         self.model = model
         self._client = None
 
@@ -241,21 +241,23 @@ class OpenAIProvider(LLMProvider):
 
 
 def get_available_providers() -> list[LLMProvider]:
-    """Return providers ordered by priority, based on available API keys.
+    """Return providers ordered by cost-optimized priority.
 
-    Priority: Anthropic (best multilingual accuracy) > OpenAI (cost-effective fallback).
+    Priority: OpenAI GPT-4.1 nano (cheapest at $0.10/1M input) >
+              Anthropic Claude Haiku 4.5 (higher quality fallback).
     Falls back gracefully to whichever provider(s) have API keys configured.
     """
     providers: list[LLMProvider] = []
 
-    if os.getenv("ANTHROPIC_API_KEY"):
-        providers.append(AnthropicProvider())
-        logger.info("Anthropic provider available (primary)")
-
+    # Cost-optimized order: cheapest first, quality fallback second
     if os.getenv("OPENAI_API_KEY"):
         providers.append(OpenAIProvider())
+        logger.info("OpenAI GPT-4.1 nano provider available (primary — cheapest)")
+
+    if os.getenv("ANTHROPIC_API_KEY"):
+        providers.append(AnthropicProvider())
         logger.info(
-            "OpenAI provider available (%s)",
+            "Anthropic Claude Haiku 4.5 provider available (%s)",
             "fallback" if providers else "primary",
         )
 
