@@ -9,13 +9,14 @@ Both providers use their SDK's native structured output features:
 - OpenAI: chat.completions.parse() with Pydantic response_format
 
 Retry logic uses tenacity with exponential backoff + jitter for resilience
-against transient errors (429 rate limits, 500/503 server errors).
+against TRANSIENT errors only (429 rate limits, 500/503 server errors, timeouts).
+Validation errors and auth errors are NOT retried.
 """
 
-import json
 import logging
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 from tenacity import (
     retry,
@@ -29,11 +30,32 @@ from app.prompt import SYSTEM_PROMPT, build_user_message
 
 logger = logging.getLogger(__name__)
 
+# Timeout for individual LLM API calls (seconds).
+# With 2 retries + backoff, worst case ≈ 15 + 3 + 15 + 6 + 15 = ~54s total,
+# but the first attempt usually succeeds in 2-5s.
+LLM_TIMEOUT_SECONDS = 15
+
 
 class LLMProviderError(Exception):
     """Raised when an LLM provider fails after retries."""
 
     pass
+
+
+class TransientLLMError(Exception):
+    """Raised for transient errors that should be retried (rate limits, timeouts)."""
+
+    pass
+
+
+@dataclass
+class LLMUsage:
+    """Token usage statistics from an LLM call."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    provider: str = ""
+    model: str = ""
 
 
 class LLMProvider(ABC):
@@ -42,8 +64,12 @@ class LLMProvider(ABC):
     @abstractmethod
     async def generate_feedback(
         self, sentence: str, target_language: str, native_language: str
-    ) -> FeedbackResponse:
-        """Generate feedback for a learner's sentence."""
+    ) -> tuple[FeedbackResponse, LLMUsage]:
+        """Generate feedback for a learner's sentence.
+
+        Returns:
+            Tuple of (parsed response, token usage stats)
+        """
         ...
 
     @property
@@ -67,21 +93,25 @@ class AnthropicProvider(LLMProvider):
     def _get_client(self):
         if self._client is None:
             import anthropic
+
             self._client = anthropic.AsyncAnthropic(
-                api_key=os.getenv("ANTHROPIC_API_KEY")
+                api_key=os.getenv("ANTHROPIC_API_KEY"),
+                timeout=LLM_TIMEOUT_SECONDS,
             )
         return self._client
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential_jitter(initial=1, max=10, jitter=2),
-        retry=retry_if_exception_type((Exception,)),
+        stop=stop_after_attempt(2),
+        wait=wait_exponential_jitter(initial=1, max=8, jitter=2),
+        retry=retry_if_exception_type(TransientLLMError),
         reraise=True,
     )
     async def generate_feedback(
         self, sentence: str, target_language: str, native_language: str
-    ) -> FeedbackResponse:
+    ) -> tuple[FeedbackResponse, LLMUsage]:
         """Generate feedback using Anthropic Claude with JSON mode."""
+        import anthropic
+
         client = self._get_client()
         user_message = build_user_message(sentence, target_language, native_language)
 
@@ -94,13 +124,36 @@ class AnthropicProvider(LLMProvider):
                 temperature=0.1,  # Low temperature for consistent corrections
             )
 
-            # Extract text content from response
+            # Extract text content and parse with Pydantic
             content = message.content[0].text
-
-            # Parse with Pydantic for strict validation
             response = FeedbackResponse.model_validate_json(content)
-            logger.info("Anthropic response parsed successfully")
-            return response
+
+            # Track token usage
+            usage = LLMUsage(
+                input_tokens=message.usage.input_tokens,
+                output_tokens=message.usage.output_tokens,
+                provider="anthropic",
+                model=self.model,
+            )
+            logger.info(
+                "Anthropic response: %d input tokens, %d output tokens",
+                usage.input_tokens,
+                usage.output_tokens,
+            )
+            return response, usage
+
+        except (
+            anthropic.APITimeoutError,
+            anthropic.RateLimitError,
+            anthropic.APIConnectionError,
+            anthropic.InternalServerError,
+        ) as e:
+            logger.warning("Anthropic transient error (will retry): %s", str(e))
+            raise TransientLLMError(str(e)) from e
+
+        except anthropic.APIStatusError as e:
+            logger.error("Anthropic API error (non-retryable): %s", str(e))
+            raise LLMProviderError(f"Anthropic API error: {str(e)}") from e
 
         except Exception as e:
             logger.error("Anthropic provider error: %s", str(e))
@@ -121,19 +174,25 @@ class OpenAIProvider(LLMProvider):
     def _get_client(self):
         if self._client is None:
             import openai
-            self._client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+            self._client = openai.AsyncOpenAI(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                timeout=LLM_TIMEOUT_SECONDS,
+            )
         return self._client
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential_jitter(initial=1, max=10, jitter=2),
-        retry=retry_if_exception_type((Exception,)),
+        stop=stop_after_attempt(2),
+        wait=wait_exponential_jitter(initial=1, max=8, jitter=2),
+        retry=retry_if_exception_type(TransientLLMError),
         reraise=True,
     )
     async def generate_feedback(
         self, sentence: str, target_language: str, native_language: str
-    ) -> FeedbackResponse:
+    ) -> tuple[FeedbackResponse, LLMUsage]:
         """Generate feedback using OpenAI with structured Pydantic output."""
+        import openai
+
         client = self._get_client()
         user_message = build_user_message(sentence, target_language, native_language)
 
@@ -152,8 +211,27 @@ class OpenAIProvider(LLMProvider):
             if response is None:
                 raise LLMProviderError("OpenAI returned null parsed response")
 
-            logger.info("OpenAI response parsed successfully")
-            return response
+            # Track token usage
+            usage = LLMUsage(
+                input_tokens=completion.usage.prompt_tokens if completion.usage else 0,
+                output_tokens=completion.usage.completion_tokens if completion.usage else 0,
+                provider="openai",
+                model=self.model,
+            )
+            logger.info(
+                "OpenAI response: %d input tokens, %d output tokens",
+                usage.input_tokens,
+                usage.output_tokens,
+            )
+            return response, usage
+
+        except (openai.APITimeoutError, openai.RateLimitError, openai.APIConnectionError) as e:
+            logger.warning("OpenAI transient error (will retry): %s", str(e))
+            raise TransientLLMError(str(e)) from e
+
+        except openai.APIStatusError as e:
+            logger.error("OpenAI API error (non-retryable): %s", str(e))
+            raise LLMProviderError(f"OpenAI API error: {str(e)}") from e
 
         except Exception as e:
             logger.error("OpenAI provider error: %s", str(e))
@@ -174,6 +252,9 @@ def get_available_providers() -> list[LLMProvider]:
 
     if os.getenv("OPENAI_API_KEY"):
         providers.append(OpenAIProvider())
-        logger.info("OpenAI provider available (%s)", "fallback" if providers else "primary")
+        logger.info(
+            "OpenAI provider available (%s)",
+            "fallback" if providers else "primary",
+        )
 
     return providers

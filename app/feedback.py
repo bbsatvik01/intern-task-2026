@@ -5,6 +5,7 @@ This is the main business logic module that ties together:
 2. Provider routing (try Anthropic first, then OpenAI fallback)
 3. Sentinel validation (verify response quality before returning)
 4. Cache storage (store validated responses for future requests)
+5. Token usage tracking (cost awareness)
 
 The max retry for sentinel validation failures is kept low (2 attempts)
 to stay within the 30-second response time requirement.
@@ -12,10 +13,11 @@ to stay within the 30-second response time requirement.
 
 import logging
 import time
+import uuid
 
 from app.cache import ResponseCache
 from app.models import FeedbackRequest, FeedbackResponse
-from app.providers import LLMProvider, LLMProviderError, get_available_providers
+from app.providers import LLMProvider, LLMProviderError, LLMUsage, get_available_providers
 from app.validators import validate_response
 
 logger = logging.getLogger(__name__)
@@ -23,8 +25,11 @@ logger = logging.getLogger(__name__)
 # Module-level singleton cache
 _cache = ResponseCache(max_size=1000, ttl_seconds=3600)
 
-# Module-level providers (initialized lazily)
+# Module-level providers (initialized on first use)
 _providers: list[LLMProvider] | None = None
+
+# Cumulative token usage for cost monitoring
+_total_usage = {"input_tokens": 0, "output_tokens": 0, "requests": 0}
 
 
 def _get_providers() -> list[LLMProvider]:
@@ -54,6 +59,7 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
     Raises:
         LLMProviderError: If all providers fail after retries
     """
+    request_id = str(uuid.uuid4())[:8]
     start_time = time.time()
 
     # 1. Cache lookup
@@ -62,7 +68,7 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
     )
     if cached is not None:
         elapsed = time.time() - start_time
-        logger.info("Cache hit — returned in %.3fs", elapsed)
+        logger.info("[%s] Cache hit — returned in %.3fs", request_id, elapsed)
         return cached
 
     # 2. Try each provider
@@ -79,35 +85,42 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
         for attempt in range(max_validation_retries):
             try:
                 logger.info(
-                    "Attempting %s (attempt %d/%d)",
+                    "[%s] Attempting %s (attempt %d/%d)",
+                    request_id,
                     provider.name,
                     attempt + 1,
                     max_validation_retries,
                 )
 
                 # 3. Generate feedback
-                response = await provider.generate_feedback(
+                response, usage = await provider.generate_feedback(
                     request.sentence,
                     request.target_language,
                     request.native_language,
                 )
 
+                # Track token usage
+                _total_usage["input_tokens"] += usage.input_tokens
+                _total_usage["output_tokens"] += usage.output_tokens
+                _total_usage["requests"] += 1
+
                 # 4. Sentinel validation
                 validation = validate_response(request, response)
                 if not validation:
                     logger.warning(
-                        "Sentinel validation failed on attempt %d: %s",
+                        "[%s] Sentinel validation failed on attempt %d: %s",
+                        request_id,
                         attempt + 1,
                         "; ".join(validation.issues),
                     )
                     if attempt < max_validation_retries - 1:
                         continue  # Retry with same provider
                     else:
-                        # Accept the response anyway if it's structurally valid
+                        # Accept the response anyway if structurally valid
                         # (Pydantic already validated the schema)
                         logger.warning(
-                            "Accepting response with validation warnings after %d attempts",
-                            max_validation_retries,
+                            "[%s] Accepting response with validation warnings",
+                            request_id,
                         )
 
                 # 5. Cache and return
@@ -120,22 +133,30 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
 
                 elapsed = time.time() - start_time
                 logger.info(
-                    "Feedback generated via %s in %.3fs (cache: %s)",
+                    "[%s] Feedback via %s in %.3fs | tokens: %d in / %d out | cache: %s",
+                    request_id,
                     provider.name,
                     elapsed,
+                    usage.input_tokens,
+                    usage.output_tokens,
                     _cache.stats,
                 )
                 return response
 
             except LLMProviderError as e:
                 last_error = e
-                logger.warning("Provider %s failed: %s", provider.name, str(e))
+                logger.warning(
+                    "[%s] Provider %s failed: %s", request_id, provider.name, str(e)
+                )
                 break  # Move to next provider
 
             except Exception as e:
                 last_error = e
                 logger.error(
-                    "Unexpected error with %s: %s", provider.name, str(e)
+                    "[%s] Unexpected error with %s: %s",
+                    request_id,
+                    provider.name,
+                    str(e),
                 )
                 break  # Move to next provider
 
@@ -148,3 +169,8 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
 def get_cache_stats() -> dict:
     """Return cache statistics for the health endpoint."""
     return _cache.stats
+
+
+def get_usage_stats() -> dict:
+    """Return cumulative token usage statistics."""
+    return dict(_total_usage)

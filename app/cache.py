@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class ResponseCache:
-    """Thread-safe in-memory cache with optional TTL and size limits."""
+    """Async-safe in-memory cache with optional TTL and size limits."""
 
     def __init__(self, max_size: int = 1000, ttl_seconds: Optional[int] = 3600):
         self._cache: dict[str, tuple[FeedbackResponse, float]] = {}

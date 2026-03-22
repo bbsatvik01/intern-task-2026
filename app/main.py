@@ -3,12 +3,16 @@
 import logging
 import time
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from app.feedback import get_cache_stats, get_feedback
+from app.feedback import get_cache_stats, get_feedback, get_usage_stats
 from app.models import FeedbackRequest, FeedbackResponse
 from app.providers import LLMProviderError
+
+# Load .env file for local development (Docker passes env vars via docker-compose)
+load_dotenv()
 
 # Configure structured logging
 logging.basicConfig(
@@ -27,10 +31,11 @@ app = FastAPI(
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint returning API status and cache statistics."""
+    """Health check endpoint returning API status, cache, and usage statistics."""
     return {
         "status": "healthy",
         "cache": get_cache_stats(),
+        "token_usage": get_usage_stats(),
     }
 
 
