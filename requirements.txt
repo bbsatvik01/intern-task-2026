@@ -1,9 +1,20 @@
-fastapi>=0.100.0
-uvicorn>=0.23.0
-pydantic>=2.0.0
-openai>=1.0.0
+# Core framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.6.0
+
+# LLM Providers (dual-provider architecture)
+openai>=1.12.0
+anthropic>=0.40.0
+
+# Resilience
+tenacity>=8.2.0
+
+# Utilities
 python-dotenv>=1.0.0
-httpx>=0.24.0
-jsonschema>=4.0.0
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
+httpx>=0.27.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+jsonschema>=4.21.0
