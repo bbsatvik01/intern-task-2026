@@ -4,30 +4,76 @@
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    Client(["Client Request"]) --> RL["Rate Limiting Middleware<br/>200 req/min per IP"]
+    RL --> LOG["Structured JSON Logging<br/>Correlation ID + Latency"]
+    LOG --> R1["POST /feedback"]
+    LOG --> R2["POST /feedback/stream"]
+    LOG --> R3["POST /feedback/paragraph"]
+    LOG --> R4["GET /health"]
+    LOG --> R5["GET /metrics"]
+
+    R1 --> PIPE
+    R2 -->|SSE Events| PIPE
+    R3 -->|Split + Concurrent| PIPE
+
+    subgraph PIPE ["Feedback Pipeline"]
+        direction TB
+        IV["Input Validation"] --> CL["Cache Lookup<br/>SHA-256 key"]
+        CL -->|Miss| GR["Guardrails<br/>Injection Detection"]
+        CL -->|Hit| RET["Return Cached"]
+        GR --> LLM["LLM Provider Router"]
+        LLM --> P1["Primary: GPT-4.1 nano"]
+        LLM -->|Fallback| P2["Claude Haiku 4.5"]
+        P1 --> SV["Sentinel Validation<br/>Grounding + Consistency"]
+        P2 --> SV
+        SV --> LC["Language Check<br/>langdetect on explanations"]
+        LC -->|Mismatch| REF["Reflexion Retry<br/>Self-Refine Pattern"]
+        LC -->|OK| QS["Quality Scoring"]
+        REF --> QS
+        QS --> CACHE["Cache + Return"]
+    end
+
+    R5 --> METRICS["Per-language<br/>Quality Tracking"]
 ```
-                     ┌──────────────────────────────────┐
-                     │    Rate Limiting Middleware       │
-                     │ (Sliding window, 200 req/min/IP) │
-                     └──────────────┬───────────────────┘
-                                    │
-                     ┌──────────────┴───────────────────┐
-                     │    Structured JSON Logging        │
-                     │ (Correlation ID, latency, path)   │
-                     └──────────────┬───────────────────┘
-                                    │
-    ┌───────────────────────────────┼───────────────────────────────┐
-    │                               │                               │
- POST /feedback              POST /feedback/stream          POST /feedback/paragraph
-    │                               │                               │
-    ├─► Input Validation      ├─► SSE Status Events          ├─► Sentence Splitting
-    ├─► Cache Lookup          │   (processing → complete)    ├─► Concurrent Processing
-    ├─► LLM Provider Router   ├─► Same Pipeline Below        └─► Aggregate Metrics
-    │   ├─► Primary: GPT-4.1 nano                              
-    │   └─► Fallback: Claude Haiku 4.5                       GET /metrics
-    ├─► XML Prompt w/ Reflexion Self-Check                   └─► Per-language quality
-    ├─► Sentinel Validation                                 
-    ├─► Quality Scoring (grounding, consistency, completeness)
-    └─► Cache + Return (200)
+
+### Request Pipeline (Detailed)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as FastAPI
+    participant Cache as LRU Cache
+    participant Guard as Guardrails
+    participant LLM as LLM Provider
+    participant Lang as Language Check
+    participant Ref as Reflexion Retry
+
+    C->>API: POST /feedback {sentence, target_lang, native_lang}
+    API->>API: Rate limit check (200/min)
+    API->>API: Input validation (Pydantic)
+    API->>Cache: Lookup SHA-256(sentence+langs)
+    alt Cache Hit
+        Cache-->>API: Cached response (~0ms)
+    else Cache Miss
+        API->>Guard: Check for prompt injection
+        Guard-->>API: Risk score
+        API->>LLM: Generate feedback (XML prompt + CoT)
+        LLM-->>API: JSON response
+        API->>API: Sentinel validation (grounding, consistency)
+        API->>Lang: Check explanation languages
+        alt Language Mismatch
+            Lang-->>API: Mismatch at indices [0, 2]
+            API->>Ref: Build reflexion prompt
+            Ref->>LLM: Self-correct with <reflexion> tags
+            LLM-->>Ref: Corrected response
+            Ref-->>API: Fixed explanations
+        end
+        API->>API: Quality scoring
+        API->>Cache: Store response
+    end
+    API-->>C: 200 OK {corrected_sentence, errors, difficulty}
 ```
 
 ## Design Decisions
@@ -193,28 +239,22 @@ Per-request quality scoring without extra LLM calls:
 
 For Pangea Chat's production deployment with thousands of concurrent learners:
 
-```
-                         ┌─────────────────────┐
-                         │    Load Balancer     │
-                         │   (Cloud Run/K8s)    │
-                         └────────┬────────────┘
-                                  │
-              ┌───────────────────┼───────────────────┐
-              ▼                   ▼                   ▼
-        ┌──────────┐       ┌──────────┐       ┌──────────┐
-        │ Worker 1 │       │ Worker 2 │       │ Worker N │
-        │(FastAPI) │       │(FastAPI) │       │(FastAPI) │
-        └────┬─────┘       └────┬─────┘       └────┬─────┘
-             │                  │                   │
-             └──────────────────┼───────────────────┘
-                                │
-                    ┌───────────┴───────────┐
-                    ▼                       ▼
-              ┌──────────┐           ┌──────────┐
-              │  Redis   │           │ LLM APIs │
-              │ (Cache)  │           │ (Anthropic│
-              └──────────┘           │  + OpenAI)│
-                                     └──────────┘
+```mermaid
+flowchart TB
+    LB["Load Balancer<br/>Cloud Run / K8s"] --> W1["Worker 1<br/>FastAPI"]
+    LB --> W2["Worker 2<br/>FastAPI"]
+    LB --> WN["Worker N<br/>FastAPI"]
+
+    W1 --> Redis[("Redis Cache<br/>Shared across workers")]
+    W2 --> Redis
+    WN --> Redis
+
+    W1 --> LLMAPI["LLM APIs<br/>OpenAI + Anthropic"]
+    W2 --> LLMAPI
+    WN --> LLMAPI
+
+    W1 --> Queue["Task Queue<br/>Celery / Cloud Tasks"]
+    Queue --> Batch["Batch Processing<br/>Essay grading"]
 ```
 
 **Key scaling strategies**:
@@ -240,20 +280,22 @@ While this implementation uses Anthropic and OpenAI per the task requirements, w
 
 For complex learner interactions beyond single-sentence correction:
 
-```
-┌──────────────────────────────────────────────────┐
-│              Orchestrator Agent                    │
-│  (Routes requests, manages conversation state)     │
-└──────┬──────────┬──────────┬──────────┬──────────┘
-       ▼          ▼          ▼          ▼
-  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
-  │Grammar  │ │Vocab    │ │Pronunc. │ │Cultural │
-  │Feedback │ │Builder  │ │Coach    │ │Context  │
-  │Agent    │ │Agent    │ │Agent    │ │Agent    │
-  └─────────┘ └─────────┘ └─────────┘ └─────────┘
+```mermaid
+flowchart TB
+    User(["Learner"]) --> Orch["Orchestrator Agent<br/>Routes requests, manages state"]
+    Orch --> GF["Grammar Feedback<br/>Agent ← this API"]
+    Orch --> VB["Vocabulary Builder<br/>Agent"]
+    Orch --> PC["Pronunciation Coach<br/>Agent"]
+    Orch --> CC["Cultural Context<br/>Agent"]
+    GF --> DB[("Learner Progress DB")]
+    VB --> DB
+    PC --> DB
+    CC --> DB
+
+    style GF fill:#4CAF50,color:#fff
 ```
 
-This feedback API serves as the **Grammar Feedback Agent** — one component in a larger multi-agent system. Each agent would specialize in one aspect of language learning, coordinated by an orchestrator that maintains conversation context and learner progress.
+This feedback API serves as the **Grammar Feedback Agent** (highlighted) — one component in a larger multi-agent system. Each agent would specialize in one aspect of language learning, coordinated by an orchestrator that maintains conversation context and learner progress.
 
 ## Getting Started
 
@@ -407,9 +449,29 @@ Since the LLM handles the linguistic analysis, we verify accuracy through:
 
 ## Supported Languages
 
-Tested with: Spanish, French, Portuguese, German, English, Japanese, Korean, Russian, Chinese, Arabic, Thai, Vietnamese, Hindi, Turkish, Italian.
+The API supports **any language** that the underlying LLM models support (100+ languages for both Claude and GPT-4.1 nano). The prompt is language-agnostic — no language-specific parsing logic exists.
 
-The API supports **any language** that the underlying LLM models support (100+ languages for both Claude and GPT-4o). The prompt is specifically designed to be language-agnostic — no language-specific parsing logic exists.
+### Per-Language Test Coverage (15 Languages Tested)
+
+| Language | Script | Unit Tests | Integration Tests | E2E Tests | Total | Error Types Tested |
+|---|---|---|---|---|---|---|
+| **Spanish** | Latin | 5 (mock) | 3 (error, rate, paragraph) | 4 (conjugation, multi-error, short, paragraph) | **12** | conjugation, gender, word_choice |
+| **French** | Latin | 1 (mock) | 1 (error) | 3 (gender, code-switching, subtle) | **5** | gender_agreement, punctuation |
+| **German** | Latin | 2 (mock) | 1 (correct) | 3 (case, correct, compound) | **6** | gender_agreement, conjugation |
+| **English** | Latin | 3 (mock) | 2 (correct, native check) | 2 (injection tests) | **7** | — (used as control/native) |
+| **Portuguese** | Latin | 1 (reflexion) | 1 (error) | 1 (gender + reflexion) | **3** | gender_agreement |
+| **Italian** | Latin | — | 1 (error) | 1 (subjunctive) | **2** | conjugation |
+| **Turkish** | Latin | — | 1 (error) | 1 (vowel harmony) | **2** | spelling |
+| **Vietnamese** | Latin+ | — | 1 (error) | 1 (diacritics) | **2** | spelling |
+| **Japanese** | CJK | — | 1 (error) | 1 (particle) | **2** | word_choice |
+| **Korean** | Hangul | — | 1 (error) | 1 (honorific) | **2** | conjugation |
+| **Chinese** | CJK | — | 1 (error) | 1 (word order + Hindi native) | **2** | word_order |
+| **Russian** | Cyrillic | — | 1 (error) | 1 (aspect) | **2** | missing_word |
+| **Arabic** | Arabic | — | 1 (error) | 1 (definiteness) | **2** | gender_agreement |
+| **Hindi** | Devanagari | — | 1 (error) | 1 (correct + script) | **2** | — |
+| **Thai** | Thai | — | 1 (error) | 1 (spelling) | **2** | spelling |
+
+**Total: 52 language-specific tests** across **15 languages**, **6 script systems** (Latin, CJK, Hangul, Cyrillic, Arabic, Devanagari, Thai).
 
 ## Cost Analysis
 
