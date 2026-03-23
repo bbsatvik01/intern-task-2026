@@ -611,3 +611,103 @@ class TestStreamingSSEFormat:
         from app.streaming import _format_sse_event
         result = _format_sse_event("data", {"sentence": "私は東京に住んでいます。"})
         assert "私は東京に住んでいます。" in result
+
+
+# ============================================================
+# Async Job Queue Unit Tests
+# ============================================================
+
+
+class TestAsyncJobQueue:
+    """Tests for the in-memory async job queue."""
+
+    def test_job_lifecycle_states(self):
+        """Jobs should transition through PENDING → PROCESSING → COMPLETED."""
+        from app.async_queue import Job, JobStatus
+        from app.models import FeedbackRequest
+
+        request = FeedbackRequest(
+            sentence="Test.", target_language="English", native_language="English"
+        )
+        job = Job(id="test-1", request=request)
+
+        # Initial state
+        assert job.status == JobStatus.PENDING
+        assert job.result is None
+
+        # Transition to processing
+        job.status = JobStatus.PROCESSING
+        assert job.status == JobStatus.PROCESSING
+
+        # Transition to completed
+        job.status = JobStatus.COMPLETED
+        job.result = {"corrected_sentence": "Test.", "is_correct": True}
+        assert job.status == JobStatus.COMPLETED
+        assert job.result is not None
+
+    def test_job_to_dict_pending(self):
+        """Pending job serialization should include job_id and status only."""
+        from app.async_queue import Job, JobStatus
+        from app.models import FeedbackRequest
+
+        request = FeedbackRequest(
+            sentence="Test.", target_language="English", native_language="English"
+        )
+        job = Job(id="abc123", request=request)
+        d = job.to_dict()
+
+        assert d["job_id"] == "abc123"
+        assert d["status"] == "pending"
+        assert "result" not in d
+        assert "error" not in d
+
+    def test_job_to_dict_completed(self):
+        """Completed job should include result and processing time."""
+        import time
+        from app.async_queue import Job, JobStatus
+        from app.models import FeedbackRequest
+
+        request = FeedbackRequest(
+            sentence="Test.", target_language="English", native_language="English"
+        )
+        job = Job(id="abc123", request=request, created_at=time.time() - 1.5)
+        job.status = JobStatus.COMPLETED
+        job.result = {"corrected_sentence": "Test."}
+        job.completed_at = time.time()
+        d = job.to_dict()
+
+        assert d["status"] == "completed"
+        assert d["result"] == {"corrected_sentence": "Test."}
+        assert "processing_time_seconds" in d
+        assert d["processing_time_seconds"] > 0
+
+    def test_queue_stats_empty(self):
+        """Empty queue should report zero counts."""
+        from app.async_queue import JobQueue
+
+        queue = JobQueue(max_jobs=10)
+        stats = queue.get_stats()
+
+        assert stats["total_jobs"] == 0
+        assert stats["pending"] == 0
+        assert stats["processing"] == 0
+        assert stats["completed"] == 0
+        assert stats["failed"] == 0
+        assert stats["capacity"] == 10
+
+    def test_job_failed_state(self):
+        """Failed job should include error message."""
+        from app.async_queue import Job, JobStatus
+        from app.models import FeedbackRequest
+
+        request = FeedbackRequest(
+            sentence="Test.", target_language="English", native_language="English"
+        )
+        job = Job(id="fail-1", request=request)
+        job.status = JobStatus.FAILED
+        job.error = "Provider unavailable"
+        d = job.to_dict()
+
+        assert d["status"] == "failed"
+        assert d["error"] == "Provider unavailable"
+

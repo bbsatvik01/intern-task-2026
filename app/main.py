@@ -5,7 +5,8 @@ Production features:
 - Per-IP rate limiting (sliding window, configurable)
 - SSE streaming endpoint for real-time feedback
 - Paragraph-level analysis for multi-sentence text
-- Quality metrics tracking per language
+- Async job queue with polling for traffic spikes
+- Quality metrics tracking per language with p95/p99 latency
 - Request/response logging with latency tracking
 """
 
@@ -23,6 +24,8 @@ from app.models import FeedbackRequest, FeedbackResponse
 from app.paragraph import router as paragraph_router
 from app.providers import LLMProviderError
 from app.rate_limiter import RateLimitMiddleware, get_rate_limiter
+from app.async_queue import get_job_queue
+from app.async_queue import router as async_router
 from app.streaming import router as streaming_router
 
 # Load .env file for local development (Docker passes env vars via docker-compose)
@@ -48,6 +51,7 @@ app.add_middleware(RateLimitMiddleware)
 # --- Routers ---
 app.include_router(streaming_router)
 app.include_router(paragraph_router)
+app.include_router(async_router)
 
 
 @app.get("/health")
@@ -58,6 +62,7 @@ async def health_check():
         "cache": get_cache_stats(),
         "token_usage": get_usage_stats(),
         "rate_limiter": get_rate_limiter().stats,
+        "job_queue": get_job_queue().get_stats(),
     }
 
 
