@@ -52,17 +52,21 @@
 
 The system prompt uses **XML-structured tags** per Anthropic's best practices (which also work with OpenAI models as plain text). Anthropic's documentation confirms XML tags reduce misinterpretation by 30%+ for complex prompts.
 
-**XML Structure** (`<role>`, `<instructions>`, `<rules>`, `<error_taxonomy>`, `<cefr_levels>`, `<examples>`, `<self_verification>`, `<output_format>`):
+**XML Structure** (`<role>`, `<tone>`, `<instructions>`, `<rules>`, `<error_taxonomy>`, `<cefr_levels>`, `<examples>`, `<edge_cases>`, `<self_verification>`, `<output_format>`):
 
-1. **Chain-of-Thought (CoT)** in `<instructions>`: Step-by-step analysis — identify language → check each word/phrase → classify errors → assess difficulty.
+1. **Tone Context** in `<tone>`: Friendly, encouraging feedback matching Pangea Chat's brand — learners practice in a safe space.
 
-2. **Few-Shot Examples** in `<examples>` with `<example id="N">` tags: Three carefully chosen examples anchor output format (Spanish conjugation, correct German, Japanese particle).
+2. **8-Step Chain-of-Thought (CoT)** in `<instructions>`: Structured linguist's diagnostic workflow — language ID → sentence parsing → error detection → error classification → correction generation → grounding verification → difficulty assessment → consistency check.
 
-3. **Explicit Error Taxonomy** in `<error_taxonomy>`: All 12 allowed error types with descriptions. CEFR levels in `<cefr_levels>` with criteria descriptors.
+3. **Five Diverse Few-Shot Examples** in `<examples>` with `<example id="N">` tags: Spanish conjugation error, correct German, Japanese particle error, French multi-error, correct Korean — covering 5 languages, 3 script systems (Latin/CJK/Hangul), both correct and incorrect sentences.
 
-4. **Strict Grounding Rules** in `<rules>`: 7 critical rules preventing hallucination, preserving learner's voice.
+4. **Explicit Error Taxonomy** in `<error_taxonomy>`: All 12 allowed error types with descriptions. CEFR levels in `<cefr_levels>` with criteria descriptors.
 
-5. **Single-Pass Reflexion** in `<self_verification>`: Instructs the LLM to self-check its output before finalizing — verify originals exist in input, check is_correct/errors consistency, validate explanations language. This is the SPOC pattern (ICLR 2025) — **zero extra API calls, zero extra cost**, but catches grounding and consistency errors within the same generation.
+5. **12 Critical Rules** in `<rules>`: 7 accuracy rules (grounding, minimal edit, anti-overcorrection) + 5 security rules preventing prompt injection, role hijacking, and system prompt leakage.
+
+6. **Edge Cases** in `<edge_cases>`: Explicit handling for short input, proper nouns, code-mixing, and colloquial language.
+
+7. **8-Check Single-Pass Reflexion** in `<self_verification>`: Self-check before output — grounding, boolean consistency, correction consistency, taxonomy validation, language verification, difficulty calibration, minimal edit verification, corrected sentence grammar. This is the SPOC pattern (ICLR 2025) — **zero extra API calls, zero extra cost**.
 
 ### 3. Structured Output (No JSON Parsing Errors — Ever)
 
@@ -305,8 +309,10 @@ docker compose exec feedback-api pytest -v
 | Rate limiting (429 enforcement) | 1 | No |
 | Paragraph endpoint (end-to-end) | 1 | Yes |
 | Streaming endpoint (SSE events) | 1 | Yes |
+| Guardrails (injection detection, risk scoring) | 8 | No |
+| Prompt validation (sections, examples, CoT) | 4 | No |
 
-**Total: 64 tests** covering 15 languages including non-Latin scripts — all passing.
+**Total: 68 tests** covering 15 languages including non-Latin scripts — all passing.
 
 ### How We Verify Accuracy for Languages We Don't Speak
 
