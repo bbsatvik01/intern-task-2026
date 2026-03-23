@@ -18,6 +18,7 @@ import time
 import uuid
 
 from app.cache import ResponseCache
+from app.metrics import get_metrics_tracker, score_response
 from app.models import FeedbackRequest, FeedbackResponse
 from app.providers import LLMProvider, LLMProviderError, LLMUsage, get_available_providers
 from app.validators import validate_response
@@ -125,7 +126,15 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
                             request_id,
                         )
 
-                # 5. Cache and return
+                # 5. Quality scoring (deterministic, no extra LLM call)
+                quality = score_response(request, response)
+                elapsed = time.time() - start_time
+                get_metrics_tracker().record(
+                    request.target_language, quality, len(response.errors),
+                    latency_seconds=elapsed,
+                )
+
+                # 6. Cache and return
                 _cache.put(
                     request.sentence,
                     request.target_language,
@@ -133,14 +142,15 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
                     response,
                 )
 
-                elapsed = time.time() - start_time
                 logger.info(
-                    "[%s] Feedback via %s in %.3fs | tokens: %d in / %d out | cache: %s",
+                    "[%s] Feedback via %s in %.3fs | tokens: %d in / %d out | "
+                    "quality: %.2f | cache: %s",
                     request_id,
                     provider.name,
                     elapsed,
                     usage.input_tokens,
                     usage.output_tokens,
+                    quality.overall_score,
                     _cache.stats,
                 )
                 return response

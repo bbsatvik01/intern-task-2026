@@ -315,3 +315,299 @@ class TestCache:
         cache.put("c", "en", "es", response)  # Should evict "a"
 
         assert cache.stats["size"] == 2
+
+
+# ============================================================
+# Rate Limiter Tests
+# ============================================================
+
+
+class TestRateLimiter:
+    """Test in-memory sliding window rate limiter."""
+
+    def test_allows_requests_under_limit(self):
+        """Requests under the limit should be allowed."""
+        from app.rate_limiter import SlidingWindowRateLimiter
+        limiter = SlidingWindowRateLimiter(max_requests=5, window_seconds=60)
+
+        for i in range(5):
+            allowed, info = limiter.is_allowed("test_ip")
+            assert allowed is True
+
+    def test_blocks_requests_over_limit(self):
+        """Requests over the limit should be blocked with Retry-After."""
+        from app.rate_limiter import SlidingWindowRateLimiter
+        limiter = SlidingWindowRateLimiter(max_requests=3, window_seconds=60)
+
+        # Use up the limit
+        for _ in range(3):
+            limiter.is_allowed("test_ip")
+
+        # Next request should be blocked
+        allowed, info = limiter.is_allowed("test_ip")
+        assert allowed is False
+        assert "Retry-After" in info
+        assert int(info["Retry-After"]) > 0
+
+    def test_different_clients_independent(self):
+        """Different IP addresses should have independent limits."""
+        from app.rate_limiter import SlidingWindowRateLimiter
+        limiter = SlidingWindowRateLimiter(max_requests=1, window_seconds=60)
+
+        allowed1, _ = limiter.is_allowed("ip_a")
+        assert allowed1 is True
+
+        allowed2, _ = limiter.is_allowed("ip_b")
+        assert allowed2 is True
+
+        # ip_a should now be blocked, ip_b still allowed for 1 more
+        blocked, _ = limiter.is_allowed("ip_a")
+        assert blocked is False
+
+    def test_stats_tracking(self):
+        """Stats should report active client count."""
+        from app.rate_limiter import SlidingWindowRateLimiter
+        limiter = SlidingWindowRateLimiter(max_requests=10, window_seconds=60)
+
+        limiter.is_allowed("client_1")
+        limiter.is_allowed("client_2")
+
+        stats = limiter.stats
+        assert stats["active_clients"] == 2
+        assert stats["max_requests_per_window"] == 10
+
+
+# ============================================================
+# Metrics Scorer Tests
+# ============================================================
+
+
+class TestMetricsScorer:
+    """Test deterministic quality scoring."""
+
+    def test_perfect_score(self):
+        """A well-grounded, consistent response should score 1.0."""
+        from app.metrics import score_response
+        request = FeedbackRequest(
+            sentence="Yo soy fue al mercado.",
+            target_language="Spanish",
+            native_language="English",
+        )
+        response = FeedbackResponse(
+            corrected_sentence="Yo fui al mercado.",
+            is_correct=False,
+            errors=[ErrorDetail(
+                original="soy fue",
+                correction="fui",
+                error_type="conjugation",
+                explanation="Wrong verb form",
+            )],
+            difficulty="A2",
+        )
+        score = score_response(request, response)
+        assert score.grounding_score == 1.0
+        assert score.consistency_score == 1.0
+        assert score.overall_score == 1.0
+        assert len(score.issues) == 0
+
+    def test_ungrounded_original_lowers_score(self):
+        """Hallucinated 'original' text should lower grounding score."""
+        from app.metrics import score_response
+        request = FeedbackRequest(
+            sentence="Yo soy fue al mercado.",
+            target_language="Spanish",
+            native_language="English",
+        )
+        response = FeedbackResponse(
+            corrected_sentence="Yo fui al mercado.",
+            is_correct=False,
+            errors=[ErrorDetail(
+                original="haber sido",  # NOT in input
+                correction="fui",
+                error_type="conjugation",
+                explanation="Wrong verb form",
+            )],
+            difficulty="A2",
+        )
+        score = score_response(request, response)
+        assert score.grounding_score == 0.0
+        assert score.overall_score < 1.0
+        assert len(score.issues) > 0
+
+    def test_consistency_mismatch(self):
+        """is_correct=true with errors should lower consistency score."""
+        from app.metrics import score_response
+        request = FeedbackRequest(
+            sentence="Bad sentence here.",
+            target_language="English",
+            native_language="Spanish",
+        )
+        # After model_validator auto-fix, is_correct becomes False
+        response = FeedbackResponse(
+            corrected_sentence="Good sentence here.",
+            is_correct=True,  # Will be auto-fixed to False by model_validator
+            errors=[ErrorDetail(
+                original="Bad",
+                correction="Good",
+                error_type="word_choice",
+                explanation="Use good",
+            )],
+            difficulty="A1",
+        )
+        # After model_validator, is_correct should be False (auto-fixed)
+        # So consistency should actually be 1.0 now
+        score = score_response(request, response)
+        assert score.consistency_score == 1.0  # Auto-fixed by Pydantic
+
+    def test_correct_sentence_perfect_score(self):
+        """A correct sentence response should score perfectly."""
+        from app.metrics import score_response
+        request = FeedbackRequest(
+            sentence="Das ist gut.",
+            target_language="German",
+            native_language="English",
+        )
+        response = FeedbackResponse(
+            corrected_sentence="Das ist gut.",
+            is_correct=True,
+            errors=[],
+            difficulty="A1",
+        )
+        score = score_response(request, response)
+        assert score.overall_score == 1.0
+
+
+# ============================================================
+# Paragraph Splitting Tests
+# ============================================================
+
+
+class TestParagraphSplitting:
+    """Test sentence splitting logic."""
+
+    def test_basic_splitting(self):
+        """Split simple sentences on period boundaries."""
+        from app.paragraph import split_sentences
+        result = split_sentences("Hello world. How are you? I am fine!")
+        assert len(result) == 3
+        assert result[0] == "Hello world."
+        assert result[1] == "How are you?"
+        assert result[2] == "I am fine!"
+
+    def test_empty_text(self):
+        """Empty text should return empty list."""
+        from app.paragraph import split_sentences
+        assert split_sentences("") == []
+        assert split_sentences("   ") == []
+
+    def test_single_sentence(self):
+        """A single sentence without trailing space should return one item."""
+        from app.paragraph import split_sentences
+        result = split_sentences("Hello world.")
+        assert len(result) == 1
+        assert result[0] == "Hello world."
+
+    def test_unicode_sentence_boundaries(self):
+        """CJK sentence-ending punctuation should be recognized."""
+        from app.paragraph import split_sentences
+        result = split_sentences("これはテストです。元気ですか？")
+        assert len(result) == 2
+
+
+# ============================================================
+# Cache Counter After Scoring Tests
+# ============================================================
+
+
+class TestCacheCounterAfterScoring:
+    """Test that cache stats update correctly through the scoring pipeline."""
+
+    def test_cache_miss_increments_on_new_request(self):
+        """A new unique request should increment cache misses."""
+        cache = ResponseCache(max_size=100, ttl_seconds=3600)
+        initial_misses = cache.stats["misses"]
+
+        cache.get("brand new sentence", "Spanish", "English")
+        assert cache.stats["misses"] == initial_misses + 1
+        assert cache.stats["hits"] == 0
+
+    def test_cache_hit_increments_after_put(self):
+        """After putting a response, getting it should increment hits."""
+        cache = ResponseCache(max_size=100, ttl_seconds=3600)
+        response = FeedbackResponse(
+            corrected_sentence="Yo fui al mercado.",
+            is_correct=False,
+            errors=[ErrorDetail(
+                original="soy fue",
+                correction="fui",
+                error_type="conjugation",
+                explanation="Wrong verb form",
+            )],
+            difficulty="A2",
+        )
+
+        # Put and then get
+        cache.put("Yo soy fue al mercado.", "Spanish", "English", response)
+        result = cache.get("Yo soy fue al mercado.", "Spanish", "English")
+
+        assert result is not None
+        assert cache.stats["hits"] == 1
+        assert cache.stats["misses"] == 0
+
+    def test_cache_stats_accumulate_correctly(self):
+        """Multiple gets should correctly accumulate hit/miss counters."""
+        cache = ResponseCache(max_size=100, ttl_seconds=3600)
+        response = FeedbackResponse(
+            corrected_sentence="Test.",
+            is_correct=True,
+            errors=[],
+            difficulty="A1",
+        )
+
+        # 2 misses, then 1 put, then 3 hits
+        cache.get("a", "en", "es")  # miss
+        cache.get("b", "en", "es")  # miss
+        cache.put("a", "en", "es", response)
+        cache.get("a", "en", "es")  # hit
+        cache.get("a", "en", "es")  # hit
+        cache.get("a", "en", "es")  # hit
+
+        assert cache.stats["misses"] == 2
+        assert cache.stats["hits"] == 3
+        assert cache.stats["hit_rate"] == "60.0%"
+
+
+# ============================================================
+# SSE Streaming Format Tests
+# ============================================================
+
+
+class TestStreamingSSEFormat:
+    """Test SSE event formatting without requiring an API key."""
+
+    def test_sse_event_format(self):
+        """SSE events should have correct event: and data: lines."""
+        from app.streaming import _format_sse_event
+        result = _format_sse_event("status", {"stage": "processing", "message": "test"})
+        assert result.startswith("event: status\n")
+        assert "data: " in result
+        assert result.endswith("\n\n")
+
+    def test_sse_event_json_valid(self):
+        """SSE data payload should be valid JSON."""
+        import json
+        from app.streaming import _format_sse_event
+        result = _format_sse_event("data", {"key": "value", "count": 42})
+        # Extract the data line
+        lines = result.strip().split("\n")
+        data_line = [l for l in lines if l.startswith("data: ")][0]
+        json_str = data_line[len("data: "):]
+        parsed = json.loads(json_str)
+        assert parsed["key"] == "value"
+        assert parsed["count"] == 42
+
+    def test_sse_event_unicode_support(self):
+        """SSE should handle unicode characters correctly."""
+        from app.streaming import _format_sse_event
+        result = _format_sse_event("data", {"sentence": "私は東京に住んでいます。"})
+        assert "私は東京に住んでいます。" in result

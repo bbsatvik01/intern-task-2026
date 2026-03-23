@@ -1,4 +1,13 @@
-"""FastAPI application with production-grade error handling and endpoints."""
+"""FastAPI application with production-grade middleware, endpoints, and monitoring.
+
+Production features:
+- Structured JSON logging with correlation IDs
+- Per-IP rate limiting (sliding window, configurable)
+- SSE streaming endpoint for real-time feedback
+- Paragraph-level analysis for multi-sentence text
+- Quality metrics tracking per language
+- Request/response logging with latency tracking
+"""
 
 import logging
 import time
@@ -8,35 +17,60 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.feedback import get_cache_stats, get_feedback, get_usage_stats
+from app.logging_config import RequestLoggingMiddleware, setup_logging
+from app.metrics import get_metrics_tracker
 from app.models import FeedbackRequest, FeedbackResponse
+from app.paragraph import router as paragraph_router
 from app.providers import LLMProviderError
+from app.rate_limiter import RateLimitMiddleware, get_rate_limiter
+from app.streaming import router as streaming_router
 
 # Load .env file for local development (Docker passes env vars via docker-compose)
 load_dotenv()
 
-# Configure structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# Initialize structured logging BEFORE any loggers are used
+setup_logging()
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Language Feedback API",
     description="LLM-powered language correction and feedback for learners",
-    version="1.0.0",
+    version="2.0.0",
 )
+
+# --- Middleware (applied in reverse order: last added = outermost) ---
+# 1. Request logging with correlation IDs (outermost — captures everything)
+app.add_middleware(RequestLoggingMiddleware)
+# 2. Rate limiting (before request processing)
+app.add_middleware(RateLimitMiddleware)
+
+# --- Routers ---
+app.include_router(streaming_router)
+app.include_router(paragraph_router)
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint returning API status, cache, and usage statistics."""
+    """Health check endpoint returning API status, cache, usage, and rate limit stats."""
     return {
         "status": "healthy",
         "cache": get_cache_stats(),
         "token_usage": get_usage_stats(),
+        "rate_limiter": get_rate_limiter().stats,
     }
+
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Quality metrics endpoint showing per-language accuracy tracking.
+
+    Returns aggregate quality scores, error counts, and accuracy rates
+    for each language that has been processed. Useful for monitoring
+    LLM output quality over time.
+    """
+    tracker = get_metrics_tracker()
+    return tracker.get_stats()
 
 
 @app.post("/feedback", response_model=FeedbackResponse)

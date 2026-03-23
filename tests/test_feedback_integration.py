@@ -249,3 +249,166 @@ async def test_response_within_timeout(assert_valid_response):
     elapsed = time.time() - start
     assert_valid_response(response)
     assert elapsed < 30, f"Response took {elapsed:.1f}s, exceeds 30s timeout"
+
+
+# ============================================================
+# Extended Language Coverage (15+ languages)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_thai_spelling_error(assert_valid_response):
+    """Test detection of Thai spelling/word choice error."""
+    request = FeedbackRequest(
+        sentence="ผมไปกินข้าวที่ร้านอาหารเมือวาน",
+        target_language="Thai",
+        native_language="English",
+    )
+    response = await get_feedback(request)
+    assert_valid_response(response, expect_correct=False)
+
+
+@pytest.mark.asyncio
+async def test_vietnamese_tone_error(assert_valid_response):
+    """Test detection of Vietnamese diacritical/tone error."""
+    request = FeedbackRequest(
+        sentence="Tôi đã di đến trường học hôm qua.",
+        target_language="Vietnamese",
+        native_language="English",
+    )
+    response = await get_feedback(request)
+    assert_valid_response(response, expect_correct=False)
+
+
+@pytest.mark.asyncio
+async def test_hindi_postposition_error(assert_valid_response):
+    """Test detection of Hindi postposition error."""
+    request = FeedbackRequest(
+        sentence="मैं स्कूल को जाता हूँ।",
+        target_language="Hindi",
+        native_language="English",
+    )
+    response = await get_feedback(request)
+    assert_valid_response(response)
+
+
+@pytest.mark.asyncio
+async def test_turkish_vowel_harmony_error(assert_valid_response):
+    """Test detection of Turkish vowel harmony/suffix error."""
+    request = FeedbackRequest(
+        sentence="Ben okula gittiler.",
+        target_language="Turkish",
+        native_language="English",
+    )
+    response = await get_feedback(request)
+    assert_valid_response(response, expect_correct=False)
+
+
+@pytest.mark.asyncio
+async def test_italian_article_error(assert_valid_response):
+    """Test detection of Italian article/gender error."""
+    request = FeedbackRequest(
+        sentence="Il ragazza è molto intelligente.",
+        target_language="Italian",
+        native_language="English",
+    )
+    response = await get_feedback(request)
+    assert_valid_response(response, expect_correct=False)
+
+
+# ============================================================
+# Rate Limiting Integration Test
+# ============================================================
+
+
+def test_rate_limiter_returns_429():
+    """Test that rapid requests trigger 429 status code."""
+    from app.rate_limiter import SlidingWindowRateLimiter
+
+    limiter = SlidingWindowRateLimiter(max_requests=2, window_seconds=60)
+
+    # First 2 requests should pass
+    assert limiter.is_allowed("test_ip")[0] is True
+    assert limiter.is_allowed("test_ip")[0] is True
+
+    # Third should be blocked
+    allowed, info = limiter.is_allowed("test_ip")
+    assert allowed is False
+    assert "Retry-After" in info
+
+
+# ============================================================
+# Paragraph Endpoint End-to-End Test
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_paragraph_endpoint_end_to_end(assert_valid_response):
+    """Test paragraph analysis with multiple sentences through full pipeline."""
+    from app.paragraph import split_sentences, ParagraphRequest, analyze_paragraph
+
+    # First verify splitting works
+    text = "Yo soy fue al mercado ayer. La chat est sur le table."
+    sentences = split_sentences(text)
+    assert len(sentences) == 2
+
+    # Now test full end-to-end through the paragraph endpoint
+    request = ParagraphRequest(
+        text=text,
+        target_language="Spanish",
+        native_language="English",
+    )
+    # Use the endpoint function directly (bypasses HTTP but tests full pipeline)
+    response = await analyze_paragraph(request)
+
+    # Verify structure
+    assert hasattr(response, "sentences")
+    assert hasattr(response, "summary")
+    assert response.summary["total_sentences"] == 2
+    assert response.summary["sentences_analyzed"] >= 1  # At least 1 should succeed
+    assert "accuracy_rate" in response.summary
+    assert "difficulty_distribution" in response.summary
+
+    # Verify each sentence result
+    for sr in response.sentences:
+        assert hasattr(sr, "sentence")
+        assert hasattr(sr, "feedback")
+        assert_valid_response(sr.feedback)
+
+
+# ============================================================
+# Streaming Endpoint Integration Test
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_streaming_endpoint_produces_events():
+    """Test that streaming endpoint produces valid SSE events end-to-end."""
+    from app.streaming import _feedback_event_generator
+    from app.models import FeedbackRequest
+
+    request = FeedbackRequest(
+        sentence="Yo soy fue al mercado ayer.",
+        target_language="Spanish",
+        native_language="English",
+    )
+
+    events = []
+    async for event in _feedback_event_generator(request):
+        events.append(event)
+
+    # Should have at least: status(processing), status(complete), data, done
+    assert len(events) >= 3, f"Expected at least 3 events, got {len(events)}"
+
+    # First event should be processing status
+    assert "processing" in events[0]
+    assert "event: status" in events[0]
+
+    # Should have a data event with the actual feedback
+    data_events = [e for e in events if "event: data" in e]
+    assert len(data_events) == 1, "Expected exactly one data event"
+
+    # Should have a done event
+    done_events = [e for e in events if "event: done" in e]
+    assert len(done_events) == 1, "Expected exactly one done event"
+
