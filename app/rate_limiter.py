@@ -27,7 +27,7 @@ from starlette.responses import JSONResponse
 logger = logging.getLogger(__name__)
 
 # Configuration from environment
-RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "20"))
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "200"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 
 

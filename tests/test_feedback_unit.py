@@ -8,6 +8,7 @@ Tests cover:
 """
 
 import time
+import unittest
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -828,4 +829,174 @@ class TestPromptExternalization:
         assert "REMINDER:" in msg
         assert "Hola mundo." in msg
 
+
+# ============================================================
+# Reflexion Retry & Language Detection Tests
+# ============================================================
+
+
+class TestLanguageCheck(unittest.TestCase):
+    """Tests for the explanation language detection module."""
+
+    def test_iso_mapping_common_languages(self):
+        """Verify ISO 639-1 mappings for commonly used languages."""
+        from app.language_check import _get_iso_code
+        assert _get_iso_code("English") == "en"
+        assert _get_iso_code("Spanish") == "es"
+        assert _get_iso_code("French") == "fr"
+        assert _get_iso_code("German") == "de"
+        assert _get_iso_code("Japanese") == "ja"
+        assert _get_iso_code("Korean") == "ko"
+        assert _get_iso_code("Portuguese") == "pt"
+        assert _get_iso_code("Arabic") == "ar"
+        assert _get_iso_code("Chinese") == "zh-cn"
+        assert _get_iso_code("Mandarin") == "zh-cn"
+        assert _get_iso_code("Hindi") == "hi"
+        assert _get_iso_code("Turkish") == "tr"
+
+    def test_iso_mapping_case_insensitive(self):
+        """ISO mapping should be case-insensitive."""
+        from app.language_check import _get_iso_code
+        assert _get_iso_code("ENGLISH") == "en"
+        assert _get_iso_code("english") == "en"
+        assert _get_iso_code("English") == "en"
+
+    def test_iso_mapping_unknown_language_returns_none(self):
+        """Unknown languages should return None (skip check)."""
+        from app.language_check import _get_iso_code
+        assert _get_iso_code("Klingon") is None
+        assert _get_iso_code("Elvish") is None
+
+    def test_check_skips_short_explanations(self):
+        """Explanations shorter than 20 chars should be skipped."""
+        from app.language_check import check_explanation_language
+        from app.models import FeedbackResponse, ErrorDetail
+        response = FeedbackResponse(
+            corrected_sentence="Test",
+            is_correct=False,
+            errors=[ErrorDetail(
+                original="test",
+                correction="fixed",
+                error_type="grammar",
+                explanation="Short"  # < 20 chars
+            )],
+            difficulty="A1",
+        )
+        result = check_explanation_language(response, "English")
+        assert result is None  # Skipped, not detected as wrong
+
+    def test_check_detects_english_explanation(self):
+        """English explanation should be detected correctly."""
+        from app.language_check import check_explanation_language
+        from app.models import FeedbackResponse, ErrorDetail
+        response = FeedbackResponse(
+            corrected_sentence="Test sentence here",
+            is_correct=False,
+            errors=[ErrorDetail(
+                original="test",
+                correction="fixed",
+                error_type="grammar",
+                explanation="This is a detailed explanation in English about the grammar error that was found."
+            )],
+            difficulty="A1",
+        )
+        result = check_explanation_language(response, "English")
+        assert result is None  # English detected, matches English native
+
+    def test_check_detects_wrong_language(self):
+        """Portuguese explanation should be flagged when native is English."""
+        from app.language_check import check_explanation_language
+        from app.models import FeedbackResponse, ErrorDetail
+        response = FeedbackResponse(
+            corrected_sentence="Eu tenho muita saudade de você.",
+            is_correct=False,
+            errors=[ErrorDetail(
+                original="muito",
+                correction="muita",
+                error_type="gender_agreement",
+                explanation="A palavra 'saudade' é feminina, então o adjetivo ou quantificador que a acompanha também deve estar no feminino."
+            )],
+            difficulty="A2",
+        )
+        result = check_explanation_language(response, "English")
+        assert result is not None
+        assert 0 in result
+
+    def test_check_skips_unknown_native_language(self):
+        """Unknown native language should cause check to be skipped."""
+        from app.language_check import check_explanation_language
+        from app.models import FeedbackResponse, ErrorDetail
+        response = FeedbackResponse(
+            corrected_sentence="Test",
+            is_correct=False,
+            errors=[ErrorDetail(
+                original="test",
+                correction="fixed",
+                error_type="grammar",
+                explanation="This is a long explanation that would normally be checked."
+            )],
+            difficulty="A1",
+        )
+        result = check_explanation_language(response, "Klingon")
+        assert result is None  # Skipped due to unknown language
+
+    def test_check_no_errors_returns_none(self):
+        """Response with no errors should skip check."""
+        from app.language_check import check_explanation_language
+        from app.models import FeedbackResponse
+        response = FeedbackResponse(
+            corrected_sentence="Test",
+            is_correct=True,
+            errors=[],
+            difficulty="A1",
+        )
+        result = check_explanation_language(response, "English")
+        assert result is None
+
+
+class TestReflexionPrompt(unittest.TestCase):
+    """Tests for the reflexion retry prompt builder."""
+
+    def test_reflexion_message_structure(self):
+        """Reflexion message should contain previous response and correction instructions."""
+        from app.prompt import build_reflexion_message
+        msg = build_reflexion_message(
+            sentence="Eu tenho muito saudades.",
+            target_language="Portuguese",
+            native_language="English",
+            previous_response_json='{"test": "data"}',
+            wrong_explanation_indices=[0],
+        )
+        assert "<reflexion>" in msg
+        assert "</reflexion>" in msg
+        assert "<student_sentence" in msg
+        assert '{"test": "data"}' in msg
+        assert "English" in msg
+        assert "WRONG language" in msg
+        assert "REMINDER:" in msg
+
+    def test_reflexion_message_indices(self):
+        """Reflexion message should list the specific wrong indices."""
+        from app.prompt import build_reflexion_message
+        msg = build_reflexion_message(
+            sentence="Test.",
+            target_language="French",
+            native_language="English",
+            previous_response_json="{}",
+            wrong_explanation_indices=[0, 2, 3],
+        )
+        assert "[0, 2, 3]" in msg
+
+    def test_reflexion_message_has_sandwich_defense(self):
+        """Reflexion message should still wrap sentence in XML tags."""
+        from app.prompt import build_reflexion_message
+        msg = build_reflexion_message(
+            sentence="Test input.",
+            target_language="Spanish",
+            native_language="English",
+            previous_response_json="{}",
+            wrong_explanation_indices=[0],
+        )
+        assert "data-role=\"content-only\"" in msg
+        assert "Test input." in msg
 
