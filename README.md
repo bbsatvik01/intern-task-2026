@@ -140,13 +140,17 @@ This isn't a prompt engineering failure; it's an inherent LLM behavior. Even wit
 
 **The Solution — Self-Refine Pattern** (Madaan et al., NeurIPS 2023):
 
-```
-   LLM Response → Language Detection → Mismatch? → Reflexion Retry → Corrected Response
-       ↓                  ↓                ↓              ↓                  ↓
-   Generate          langdetect       Check if        Build targeted     Use corrected
-   feedback           on each        explanation      reflexion prompt   response (or
-                    explanation       lang matches     with <reflexion>   gracefully
-                                    native_language    XML tags           fallback)
+```mermaid
+flowchart LR
+    A["LLM Response"] --> B["Language Detection\nlangdetect on each\nexplanation"]
+    B --> C{"Mismatch?"}
+    C -->|"Language matches\nnative_language"| E["Return Response ✅"]
+    C -->|"Wrong language\ndetected"| D["Reflexion Retry\nBuild targeted prompt\nwith XML tags"]
+    D --> F["Corrected Response\nor graceful fallback"]
+
+    style C fill:#FF9800,color:#fff
+    style D fill:#2196F3,color:#fff
+    style E fill:#4CAF50,color:#fff
 ```
 
 **How it works:**
