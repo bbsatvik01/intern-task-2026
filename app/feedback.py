@@ -5,6 +5,7 @@ from __future__ import annotations
 This is the main business logic module that ties together:
 1. Input guardrails (prompt injection detection — warn-only)
 2. Cache lookup (avoid redundant API calls)
+2.5. Explanation language validation (post-processing with langdetect)
 3. Provider routing (try Anthropic first, then OpenAI fallback)
 4. Sentinel validation (verify response quality before returning)
 5. Cache storage (store validated responses for future requests)
@@ -20,6 +21,7 @@ import uuid
 
 from app.cache import ResponseCache
 from app.guardrails import scan_input
+from app.language_check import check_explanation_language
 from app.metrics import get_metrics_tracker, score_response
 from app.models import FeedbackRequest, FeedbackResponse
 from app.providers import LLMProvider, LLMProviderError, LLMUsage, get_available_providers
@@ -137,6 +139,46 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
                             "[%s] Accepting response with validation warnings",
                             request_id,
                         )
+
+                # 4.5 Explanation language check (Self-Refine pattern)
+                # Detect if explanations were written in target language
+                # instead of native language, and retry with reflexion if so.
+                if response.errors:
+                    wrong_indices = check_explanation_language(
+                        response, request.native_language
+                    )
+                    if wrong_indices is not None:
+                        logger.info(
+                            "[%s] Explanation language mismatch at indices %s — "
+                            "triggering reflexion retry",
+                            request_id,
+                            wrong_indices,
+                        )
+                        try:
+                            reflexion_response, reflexion_usage = (
+                                await provider.generate_reflexion_feedback(
+                                    request.sentence,
+                                    request.target_language,
+                                    request.native_language,
+                                    response,
+                                    wrong_indices,
+                                )
+                            )
+                            _total_usage["input_tokens"] += reflexion_usage.input_tokens
+                            _total_usage["output_tokens"] += reflexion_usage.output_tokens
+                            _total_usage["requests"] += 1
+                            response = reflexion_response
+                            logger.info(
+                                "[%s] Reflexion retry succeeded — explanations corrected",
+                                request_id,
+                            )
+                        except Exception as e:
+                            # Reflexion retry failed — use original response
+                            logger.warning(
+                                "[%s] Reflexion retry failed: %s — using original",
+                                request_id,
+                                str(e),
+                            )
 
                 # 5. Quality scoring (deterministic, no extra LLM call)
                 quality = score_response(request, response)

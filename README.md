@@ -312,7 +312,7 @@ docker compose exec feedback-api pytest -v
 | Guardrails (injection detection, risk scoring) | 8 | No |
 | Prompt validation (sections, examples, CoT) | 4 | No |
 
-**Total: 68 tests** covering 15 languages including non-Latin scripts — all passing.
+**Total: 82 tests** covering 15 languages including non-Latin scripts — all passing.
 
 ### How We Verify Accuracy for Languages We Don't Speak
 

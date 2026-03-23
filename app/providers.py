@@ -28,7 +28,7 @@ from tenacity import (
 )
 
 from app.models import FeedbackResponse
-from app.prompt import SYSTEM_PROMPT, build_user_message
+from app.prompt import SYSTEM_PROMPT, build_reflexion_message, build_user_message
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,24 @@ class LLMProvider(ABC):
     def name(self) -> str:
         """Human-readable provider name for logging."""
         ...
+
+    async def generate_reflexion_feedback(
+        self,
+        sentence: str,
+        target_language: str,
+        native_language: str,
+        previous_response: FeedbackResponse,
+        wrong_indices: list[int],
+    ) -> tuple[FeedbackResponse, LLMUsage]:
+        """Retry with reflexion: feed LLM its own output + specific error feedback.
+
+        Implements Self-Refine (Madaan et al., NeurIPS 2023) for explanation
+        language correction. Default implementation calls generate_feedback
+        with a reflexion message — subclasses can override for provider-specific
+        optimizations.
+        """
+        # Default: simple retry (subclasses override with reflexion message)
+        return await self.generate_feedback(sentence, target_language, native_language)
 
 
 class AnthropicProvider(LLMProvider):
@@ -161,6 +179,45 @@ class AnthropicProvider(LLMProvider):
             logger.error("Anthropic provider error: %s", str(e))
             raise LLMProviderError(f"Anthropic failed: {str(e)}") from e
 
+    async def generate_reflexion_feedback(
+        self,
+        sentence: str,
+        target_language: str,
+        native_language: str,
+        previous_response: FeedbackResponse,
+        wrong_indices: list[int],
+    ) -> tuple[FeedbackResponse, LLMUsage]:
+        """Reflexion retry using Anthropic Claude with the previous response as context."""
+        import anthropic
+
+        client = self._get_client()
+        previous_json = previous_response.model_dump_json(indent=2)
+        reflexion_msg = build_reflexion_message(
+            sentence, target_language, native_language, previous_json, wrong_indices
+        )
+
+        try:
+            message = await client.messages.create(
+                model=self.model,
+                max_tokens=2048,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": reflexion_msg}],
+                temperature=0.1,
+            )
+            content = message.content[0].text
+            response = FeedbackResponse.model_validate_json(content)
+            usage = LLMUsage(
+                input_tokens=message.usage.input_tokens,
+                output_tokens=message.usage.output_tokens,
+                provider="anthropic",
+                model=self.model,
+            )
+            logger.info("Anthropic reflexion: %d in / %d out tokens", usage.input_tokens, usage.output_tokens)
+            return response, usage
+        except Exception as e:
+            logger.warning("Anthropic reflexion failed: %s", str(e))
+            raise LLMProviderError(f"Anthropic reflexion failed: {str(e)}") from e
+
 
 class OpenAIProvider(LLMProvider):
     """OpenAI provider using chat.completions.parse() with Pydantic structured output."""
@@ -238,6 +295,48 @@ class OpenAIProvider(LLMProvider):
         except Exception as e:
             logger.error("OpenAI provider error: %s", str(e))
             raise LLMProviderError(f"OpenAI failed: {str(e)}") from e
+
+    async def generate_reflexion_feedback(
+        self,
+        sentence: str,
+        target_language: str,
+        native_language: str,
+        previous_response: FeedbackResponse,
+        wrong_indices: list[int],
+    ) -> tuple[FeedbackResponse, LLMUsage]:
+        """Reflexion retry using OpenAI with the previous response as context."""
+        import openai
+
+        client = self._get_client()
+        previous_json = previous_response.model_dump_json(indent=2)
+        reflexion_msg = build_reflexion_message(
+            sentence, target_language, native_language, previous_json, wrong_indices
+        )
+
+        try:
+            completion = await client.beta.chat.completions.parse(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": reflexion_msg},
+                ],
+                response_format=FeedbackResponse,
+                temperature=0.1,
+            )
+            response = completion.choices[0].message.parsed
+            if response is None:
+                raise LLMProviderError("OpenAI reflexion returned null parsed response")
+            usage = LLMUsage(
+                input_tokens=completion.usage.prompt_tokens if completion.usage else 0,
+                output_tokens=completion.usage.completion_tokens if completion.usage else 0,
+                provider="openai",
+                model=self.model,
+            )
+            logger.info("OpenAI reflexion: %d in / %d out tokens", usage.input_tokens, usage.output_tokens)
+            return response, usage
+        except Exception as e:
+            logger.warning("OpenAI reflexion failed: %s", str(e))
+            raise LLMProviderError(f"OpenAI reflexion failed: {str(e)}") from e
 
 
 def get_available_providers() -> list[LLMProvider]:
