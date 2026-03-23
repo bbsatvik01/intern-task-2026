@@ -795,6 +795,30 @@ class TestPromptExternalization:
         assert "<rules>" in SYSTEM_PROMPT
         assert "SECURITY RULES" in SYSTEM_PROMPT
 
+    def test_prompt_has_all_required_sections(self):
+        """Prompt should contain all state-of-the-art sections."""
+        from app.prompt import SYSTEM_PROMPT
+        required_tags = [
+            "<tone>", "<instructions>", "<rules>", "<error_taxonomy>",
+            "<cefr_levels>", "<examples>", "<edge_cases>",
+            "<self_verification>", "<output_format>",
+        ]
+        for tag in required_tags:
+            assert tag in SYSTEM_PROMPT, f"Missing section: {tag}"
+
+    def test_prompt_has_five_examples(self):
+        """Prompt should have 5 diverse few-shot examples."""
+        from app.prompt import SYSTEM_PROMPT
+        for i in range(1, 6):
+            assert f'id="{i}"' in SYSTEM_PROMPT, f"Missing example {i}"
+
+    def test_prompt_has_chain_of_thought(self):
+        """Prompt should include structured analysis steps."""
+        from app.prompt import SYSTEM_PROMPT
+        assert "Step 1" in SYSTEM_PROMPT
+        assert "Step 8" in SYSTEM_PROMPT
+        assert "Grounding Verification" in SYSTEM_PROMPT
+
     def test_sandwich_defense_in_user_message(self):
         """User message should wrap sentence in XML tags with sandwich reminder."""
         from app.prompt import build_user_message
