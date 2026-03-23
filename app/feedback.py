@@ -3,11 +3,12 @@ from __future__ import annotations
 """Feedback orchestration: provider routing, caching, and sentinel validation.
 
 This is the main business logic module that ties together:
-1. Cache lookup (avoid redundant API calls)
-2. Provider routing (try Anthropic first, then OpenAI fallback)
-3. Sentinel validation (verify response quality before returning)
-4. Cache storage (store validated responses for future requests)
-5. Token usage tracking (cost awareness)
+1. Input guardrails (prompt injection detection — warn-only)
+2. Cache lookup (avoid redundant API calls)
+3. Provider routing (try Anthropic first, then OpenAI fallback)
+4. Sentinel validation (verify response quality before returning)
+5. Cache storage (store validated responses for future requests)
+6. Token usage tracking (cost awareness)
 
 The max retry for sentinel validation failures is kept low (2 attempts)
 to stay within the 30-second response time requirement.
@@ -18,6 +19,7 @@ import time
 import uuid
 
 from app.cache import ResponseCache
+from app.guardrails import scan_input
 from app.metrics import get_metrics_tracker, score_response
 from app.models import FeedbackRequest, FeedbackResponse
 from app.providers import LLMProvider, LLMProviderError, LLMUsage, get_available_providers
@@ -64,6 +66,16 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
     """
     request_id = str(uuid.uuid4())[:8]
     start_time = time.time()
+
+    # 0. Input guardrails (warn-only — logs but never blocks)
+    guardrail_result = scan_input(request.sentence)
+    if not guardrail_result.is_safe:
+        logger.warning(
+            "[%s] Guardrail alert: risk_score=%.1f categories=%s",
+            request_id,
+            guardrail_result.risk_score,
+            [v[0] for v in guardrail_result.violations],
+        )
 
     # 1. Cache lookup
     cached = _cache.get(
