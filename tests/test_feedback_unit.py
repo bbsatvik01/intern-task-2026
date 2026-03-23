@@ -85,15 +85,36 @@ class TestModels:
         )
         assert response.is_correct is True
 
-    def test_invalid_error_type_rejected(self):
-        """An invalid error_type should raise a validation error."""
-        with pytest.raises(Exception):  # Pydantic ValidationError
-            ErrorDetail(
-                original="bad",
-                correction="good",
-                error_type="nonexistent_type",
-                explanation="Test",
+    def test_invalid_error_type_normalizes_to_other(self):
+        """An unknown error_type should normalize to 'other' via alias mapping."""
+        error = ErrorDetail(
+            original="bad",
+            correction="good",
+            error_type="nonexistent_type",
+            explanation="Test",
+        )
+        assert error.error_type == "other"
+
+    def test_error_type_alias_mapping(self):
+        """Known aliases should normalize to valid error types."""
+        aliases = {
+            "verb_conjugation": "conjugation",
+            "tense": "conjugation",
+            "particle": "grammar",
+            "typo": "spelling",
+            "vocabulary": "word_choice",
+            "formality": "tone_register",
+            "redundant": "extra_word",
+            "omission": "missing_word",
+            "plural": "number_agreement",
+            "gender": "gender_agreement",
+        }
+        for alias, expected in aliases.items():
+            error = ErrorDetail(
+                original="x", correction="y",
+                error_type=alias, explanation="Test",
             )
+            assert error.error_type == expected, f"{alias} should map to {expected}"
 
     def test_invalid_cefr_level_rejected(self):
         """An invalid CEFR level should raise a validation error."""
@@ -245,9 +266,10 @@ class TestValidators:
 
 
 class TestCache:
-    """Test in-memory response cache."""
+    """Test in-memory response cache (async-safe with asyncio.Lock)."""
 
-    def test_cache_miss_then_hit(self):
+    @pytest.mark.asyncio
+    async def test_cache_miss_then_hit(self):
         """First lookup should miss, second should hit."""
         cache = ResponseCache()
         response = FeedbackResponse(
@@ -258,19 +280,20 @@ class TestCache:
         )
 
         # Miss
-        assert cache.get("test", "Spanish", "English") is None
+        assert await cache.get("test", "Spanish", "English") is None
         assert cache.stats["misses"] == 1
 
         # Store
-        cache.put("test", "Spanish", "English", response)
+        await cache.put("test", "Spanish", "English", response)
 
         # Hit
-        result = cache.get("test", "Spanish", "English")
+        result = await cache.get("test", "Spanish", "English")
         assert result is not None
         assert result.corrected_sentence == "Fixed."
         assert cache.stats["hits"] == 1
 
-    def test_cache_key_varies_by_language(self):
+    @pytest.mark.asyncio
+    async def test_cache_key_varies_by_language(self):
         """Different language pairs should have different cache keys."""
         cache = ResponseCache()
         response = FeedbackResponse(
@@ -280,11 +303,12 @@ class TestCache:
             difficulty="A1",
         )
 
-        cache.put("Hello", "English", "Spanish", response)
-        assert cache.get("Hello", "English", "Spanish") is not None
-        assert cache.get("Hello", "English", "French") is None  # Different native lang
+        await cache.put("Hello", "English", "Spanish", response)
+        assert await cache.get("Hello", "English", "Spanish") is not None
+        assert await cache.get("Hello", "English", "French") is None  # Different native lang
 
-    def test_cache_ttl_expiry(self):
+    @pytest.mark.asyncio
+    async def test_cache_ttl_expiry(self):
         """Entries should expire after TTL."""
         cache = ResponseCache(ttl_seconds=1)
         response = FeedbackResponse(
@@ -294,14 +318,16 @@ class TestCache:
             difficulty="A1",
         )
 
-        cache.put("test", "en", "es", response)
-        assert cache.get("test", "en", "es") is not None
+        await cache.put("test", "en", "es", response)
+        assert await cache.get("test", "en", "es") is not None
 
         # Wait for TTL to expire
-        time.sleep(1.1)
-        assert cache.get("test", "en", "es") is None
+        import asyncio
+        await asyncio.sleep(1.1)
+        assert await cache.get("test", "en", "es") is None
 
-    def test_cache_max_size_eviction(self):
+    @pytest.mark.asyncio
+    async def test_cache_max_size_eviction(self):
         """Cache should evict oldest entries when full."""
         cache = ResponseCache(max_size=2)
         response = FeedbackResponse(
@@ -311,11 +337,27 @@ class TestCache:
             difficulty="A1",
         )
 
-        cache.put("a", "en", "es", response)
-        cache.put("b", "en", "es", response)
-        cache.put("c", "en", "es", response)  # Should evict "a"
+        await cache.put("a", "en", "es", response)
+        await cache.put("b", "en", "es", response)
+        await cache.put("c", "en", "es", response)  # Should evict "a"
 
         assert cache.stats["size"] == 2
+
+    @pytest.mark.asyncio
+    async def test_in_flight_deduplication(self):
+        """In-flight dedup should return same future for identical requests."""
+        cache = ResponseCache()
+        future = cache.set_in_flight("test", "en", "es")
+        assert future is not None
+
+        # Same request should get the in-flight future
+        existing = cache.get_in_flight("test", "en", "es")
+        assert existing is not None
+        assert existing is future
+        assert cache.stats["dedup_hits"] == 1
+
+        # Different request should not get any future
+        assert cache.get_in_flight("other", "en", "es") is None
 
 
 # ============================================================
@@ -523,16 +565,18 @@ class TestParagraphSplitting:
 class TestCacheCounterAfterScoring:
     """Test that cache stats update correctly through the scoring pipeline."""
 
-    def test_cache_miss_increments_on_new_request(self):
+    @pytest.mark.asyncio
+    async def test_cache_miss_increments_on_new_request(self):
         """A new unique request should increment cache misses."""
         cache = ResponseCache(max_size=100, ttl_seconds=3600)
         initial_misses = cache.stats["misses"]
 
-        cache.get("brand new sentence", "Spanish", "English")
+        await cache.get("brand new sentence", "Spanish", "English")
         assert cache.stats["misses"] == initial_misses + 1
         assert cache.stats["hits"] == 0
 
-    def test_cache_hit_increments_after_put(self):
+    @pytest.mark.asyncio
+    async def test_cache_hit_increments_after_put(self):
         """After putting a response, getting it should increment hits."""
         cache = ResponseCache(max_size=100, ttl_seconds=3600)
         response = FeedbackResponse(
@@ -548,14 +592,15 @@ class TestCacheCounterAfterScoring:
         )
 
         # Put and then get
-        cache.put("Yo soy fue al mercado.", "Spanish", "English", response)
-        result = cache.get("Yo soy fue al mercado.", "Spanish", "English")
+        await cache.put("Yo soy fue al mercado.", "Spanish", "English", response)
+        result = await cache.get("Yo soy fue al mercado.", "Spanish", "English")
 
         assert result is not None
         assert cache.stats["hits"] == 1
         assert cache.stats["misses"] == 0
 
-    def test_cache_stats_accumulate_correctly(self):
+    @pytest.mark.asyncio
+    async def test_cache_stats_accumulate_correctly(self):
         """Multiple gets should correctly accumulate hit/miss counters."""
         cache = ResponseCache(max_size=100, ttl_seconds=3600)
         response = FeedbackResponse(
@@ -566,12 +611,12 @@ class TestCacheCounterAfterScoring:
         )
 
         # 2 misses, then 1 put, then 3 hits
-        cache.get("a", "en", "es")  # miss
-        cache.get("b", "en", "es")  # miss
-        cache.put("a", "en", "es", response)
-        cache.get("a", "en", "es")  # hit
-        cache.get("a", "en", "es")  # hit
-        cache.get("a", "en", "es")  # hit
+        await cache.get("a", "en", "es")  # miss
+        await cache.get("b", "en", "es")  # miss
+        await cache.put("a", "en", "es", response)
+        await cache.get("a", "en", "es")  # hit
+        await cache.get("a", "en", "es")  # hit
+        await cache.get("a", "en", "es")  # hit
 
         assert cache.stats["misses"] == 2
         assert cache.stats["hits"] == 3
@@ -807,10 +852,10 @@ class TestPromptExternalization:
         for tag in required_tags:
             assert tag in SYSTEM_PROMPT, f"Missing section: {tag}"
 
-    def test_prompt_has_five_examples(self):
-        """Prompt should have 5 diverse few-shot examples."""
+    def test_prompt_has_six_examples(self):
+        """Prompt should have 6 diverse few-shot examples covering different scripts."""
         from app.prompt import SYSTEM_PROMPT
-        for i in range(1, 6):
+        for i in range(1, 7):
             assert f'id="{i}"' in SYSTEM_PROMPT, f"Missing example {i}"
 
     def test_prompt_has_chain_of_thought(self):

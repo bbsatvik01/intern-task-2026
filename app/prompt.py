@@ -12,7 +12,7 @@ Design decisions (informed by prompt management best practices research):
   explicit data-only annotation, and a post-input reminder reinforces the
   system's role. This is an OWASP-recommended defense against prompt injection.
 - Chain-of-thought: The prompt asks the LLM to analyze via 8-step process
-- Few-shot: 5 diverse examples anchor output format (ES/DE/JA/FR/KO scripts)
+- Few-shot: 6 diverse examples anchor output format (ES/DE/JA/FR/KO/AR — 6 scripts)
 - Single-pass reflexion: 8 self-verification checks (SPOC pattern, ICLR 2025)
 """
 

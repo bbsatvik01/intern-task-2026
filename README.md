@@ -1,6 +1,6 @@
 # Language Feedback API
 
-> A production-grade, LLM-powered language correction and feedback API for language learners. Built with FastAPI, OpenAI GPT-4.1 nano, and Anthropic Claude Haiku 4.5 — featuring XML-structured prompts, single-pass reflexion, SSE streaming, per-IP rate limiting, paragraph analysis, and per-language quality metrics. Designed for real-world deployment in [Pangea Chat](https://pangea.chat)'s language learning ecosystem.
+> A production-grade, LLM-powered language correction and feedback API for language learners. Built with FastAPI, OpenAI GPT-4.1 nano, and Anthropic Claude Haiku 4.5 — featuring XML-structured prompts, 6 few-shot examples across 6 scripts, single-pass reflexion, SSE streaming, in-flight request deduplication, per-IP rate limiting, paragraph analysis, per-language quality metrics, and 20-entry error type alias normalization. Designed for real-world deployment in [Pangea Chat](https://pangea.chat)'s language learning ecosystem.
 
 ## Architecture
 
@@ -104,7 +104,7 @@ The system prompt uses **XML-structured tags** per Anthropic's best practices (w
 
 2. **8-Step Chain-of-Thought (CoT)** in `<instructions>`: Structured linguist's diagnostic workflow — language ID → sentence parsing → error detection → error classification → correction generation → grounding verification → difficulty assessment → consistency check.
 
-3. **Five Diverse Few-Shot Examples** in `<examples>` with `<example id="N">` tags: Spanish conjugation error, correct German, Japanese particle error, French multi-error, correct Korean — covering 5 languages, 3 script systems (Latin/CJK/Hangul), both correct and incorrect sentences.
+3. **Six Diverse Few-Shot Examples** in `<examples>` with `<example id="N">` tags: Spanish conjugation error, correct German, Japanese particle error, French multi-error, correct Korean, **Arabic RTL cross-lingual (Spanish native)** — covering **6 languages, 6 script systems** (Latin/CJK/Hangul/Arabic/mixed), both correct and incorrect sentences, with cross-lingual explanation demonstration.
 
 4. **Explicit Error Taxonomy** in `<error_taxonomy>`: All 12 allowed error types with descriptions. CEFR levels in `<cefr_levels>` with criteria descriptors.
 
@@ -120,7 +120,7 @@ Both providers use their SDK's native structured output capabilities:
 - **Anthropic**: JSON mode + Pydantic `model_validate_json()` for post-hoc validation
 - **OpenAI**: `chat.completions.parse()` with Pydantic `response_format` for token-level schema enforcement
 
-Combined with `Literal` types for `error_type` (12 valid values) and `difficulty` (6 CEFR levels), plus a Pydantic `model_validator` that auto-fixes `is_correct`/`errors` inconsistencies, this ensures **100% schema-valid responses**.
+Combined with `Literal` types for `error_type` (12 valid values) and `difficulty` (6 CEFR levels), `ConfigDict(extra='forbid')` rejection of unexpected LLM fields, **20-entry error type alias mapping** that normalizes common LLM mislabels (e.g., `verb_conjugation`→`conjugation`, `typo`→`spelling`, `particle`→`grammar`), plus a Pydantic `model_validator` that auto-fixes `is_correct`/`errors` inconsistencies, this ensures **100% schema-valid responses**.
 
 ### 4. Sentinel Validation (Without a Second LLM Call)
 
@@ -181,14 +181,15 @@ The reflexion retry **triggered on 6 out of 24 E2E test cases** — proving this
 
 **Why this matters for Pangea Chat**: A learner studying Chinese whose native language is Hindi would receive explanations in **Hindi (Devanagari script)**, not Chinese. Without the reflexion retry, they would have received Chinese explanations they can't read — making the feedback useless.
 
-### 6. Cost-Effective Caching
+### 6. Cost-Effective Caching (Async-Safe + In-Flight Deduplication)
 
-In-memory LRU cache with SHA-256 hash keys: `hash(sentence + target_language + native_language)`.
+In-memory LRU cache with `asyncio.Lock` for concurrent safety and SHA-256 hash keys: `hash(sentence + target_language + native_language)`. **Input normalization** (`.strip().lower()`) ensures "Yo fui" and " yo fui " hit the same cache entry.
 
 - **Why in-memory?** Zero dependencies, instant deployment. For horizontal scaling, swap to Redis with one config change.
 - **TTL**: 1 hour (grammar rules don't change, but model improvements should eventually refresh cached responses).
 - **Max size**: 1000 entries with LRU eviction.
-- **Impact**: Identical requests return in ~0ms vs 2-5s. In a classroom setting where multiple students may submit similar sentences, this dramatically reduces both latency and cost.
+- **In-flight deduplication**: Concurrent identical requests share a **single LLM call** via `asyncio.Future`. If 10 students submit the same sentence simultaneously, only 1 API call is made — the other 9 await the result.
+- **Impact**: Identical requests return in ~0ms vs 2-5s. Dedup prevents wasted API spend during classroom bursts.
 
 ### 7. Token Usage Tracking
 
@@ -406,7 +407,7 @@ docker compose exec feedback-api pytest -v
 | Paragraph endpoint (end-to-end) | 1 | Yes |
 | Streaming endpoint (SSE events) | 1 | Yes |
 
-**Total: 93 tests** covering 15 languages including non-Latin scripts — all passing.
+**Total: 95 tests** covering 15 languages including non-Latin scripts — all passing.
 
 ### E2E Test Results (Real-Time API, Uncached)
 

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 This is the main business logic module that ties together:
 1. Input guardrails (prompt injection detection — warn-only)
-2. Cache lookup (avoid redundant API calls)
-2.5. Explanation language validation (post-processing with langdetect)
-3. Provider routing (try Anthropic first, then OpenAI fallback)
-4. Sentinel validation (verify response quality before returning)
-5. Cache storage (store validated responses for future requests)
-6. Token usage tracking (cost awareness)
+2. Cache lookup with async-safe locking (avoid redundant API calls)
+2.5. In-flight request deduplication (concurrent identical requests share one LLM call)
+3. Explanation language validation (post-processing with langdetect)
+4. Provider routing (try OpenAI first, then Anthropic fallback)
+5. Sentinel validation (verify response quality before returning)
+6. Localized fallback responses (graceful degradation in learner's native language)
+7. Cache storage (store validated responses for future requests)
+8. Token usage tracking (cost awareness)
 
 The max retry for sentinel validation failures is kept low (2 attempts)
 to stay within the 30-second response time requirement.
@@ -20,6 +22,7 @@ import time
 import uuid
 
 from app.cache import ResponseCache
+from app.fallbacks import build_fallback_response
 from app.guardrails import scan_input
 from app.language_check import check_explanation_language
 from app.metrics import get_metrics_tracker, score_response
@@ -52,10 +55,13 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
 
     Flow:
     1. Check cache → return immediately if hit
-    2. Try each provider in priority order (Anthropic → OpenAI)
+    1.5. Check in-flight dedup → await existing Future if same request in progress
+    2. Try each provider in priority order (OpenAI → Anthropic)
     3. Validate response with sentinel checks
     4. If validation fails, retry with next provider or re-attempt
+    4.5. Check explanation language, reflexion retry if mismatch
     5. Cache and return the validated response
+    6. On total failure → return localized fallback response
 
     Args:
         request: The learner's sentence and language info
@@ -64,7 +70,7 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
         FeedbackResponse with corrections, errors, and difficulty
 
     Raises:
-        LLMProviderError: If all providers fail after retries
+        LLMProviderError: If all providers fail and fallback is disabled
     """
     request_id = str(uuid.uuid4())[:8]
     start_time = time.time()
@@ -79,8 +85,8 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
             [v[0] for v in guardrail_result.violations],
         )
 
-    # 1. Cache lookup
-    cached = _cache.get(
+    # 1. Cache lookup (async-safe)
+    cached = await _cache.get(
         request.sentence, request.target_language, request.native_language
     )
     if cached is not None:
@@ -88,9 +94,31 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
         logger.info("[%s] Cache hit — returned in %.3fs", request_id, elapsed)
         return cached
 
+    # 1.5. In-flight request deduplication
+    # If an identical request is already being processed, wait for it
+    in_flight_future = _cache.get_in_flight(
+        request.sentence, request.target_language, request.native_language
+    )
+    if in_flight_future is not None:
+        logger.info("[%s] Dedup: awaiting in-flight request", request_id)
+        try:
+            return await in_flight_future
+        except Exception:
+            # If the in-flight request failed, we'll try ourselves
+            logger.info("[%s] In-flight request failed, retrying", request_id)
+
+    # Register ourselves as the in-flight handler for this request
+    future = _cache.set_in_flight(
+        request.sentence, request.target_language, request.native_language
+    )
+
     # 2. Try each provider
     providers = _get_providers()
     if not providers:
+        _cache.cancel_in_flight(
+            request.sentence, request.target_language, request.native_language,
+            LLMProviderError("No providers"),
+        )
         raise LLMProviderError(
             "No LLM providers available. Set OPENAI_API_KEY or ANTHROPIC_API_KEY."
         )
@@ -189,11 +217,17 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
                 )
 
                 # 6. Cache and return
-                _cache.put(
+                await _cache.put(
                     request.sentence,
                     request.target_language,
                     request.native_language,
                     response,
+                )
+
+                # Resolve in-flight future for any waiting requests
+                _cache.resolve_in_flight(
+                    request.sentence, request.target_language,
+                    request.native_language, response,
                 )
 
                 logger.info(
@@ -226,10 +260,20 @@ async def get_feedback(request: FeedbackRequest) -> FeedbackResponse:
                 )
                 break  # Move to next provider
 
-    # All providers failed
-    raise LLMProviderError(
-        f"All LLM providers failed. Last error: {last_error}"
+    # All providers failed — cancel in-flight and return localized fallback
+    error = LLMProviderError(f"All LLM providers failed. Last error: {last_error}")
+    _cache.cancel_in_flight(
+        request.sentence, request.target_language, request.native_language, error,
     )
+
+    # Graceful degradation: return localized fallback instead of crashing
+    logger.error(
+        "[%s] All providers failed. Returning localized fallback response. "
+        "Last error: %s",
+        request_id,
+        str(last_error),
+    )
+    return build_fallback_response(request.sentence, request.native_language)
 
 
 def get_cache_stats() -> dict:

@@ -179,6 +179,25 @@ Response:
   "difficulty": "A2"
 }
 </example>
+<example id="6" scenario="RTL script error with cross-lingual explanation (Arabic → Spanish)">
+Target language: Arabic
+Native language: Spanish
+Sentence: أنا ذهبت إلي المدرسة أمس.
+Response:
+{
+  "corrected_sentence": "أنا ذهبت إلى المدرسة أمس.",
+  "is_correct": false,
+  "errors": [
+    {
+      "original": "إلي",
+      "correction": "إلى",
+      "error_type": "spelling",
+      "explanation": "La preposición 'إلى' (hacia/a) se escribe con 'ى' (alif maqsura) al final, no con 'ي' (ya). Es un error muy común — ¡sigue practicando!"
+    }
+  ],
+  "difficulty": "A2"
+}
+</example>
 </examples>
 
 <edge_cases>
