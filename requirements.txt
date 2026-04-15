@@ -10,6 +10,9 @@ anthropic>=0.40.0
 # Resilience
 tenacity>=8.2.0
 
+# Gemini Live API (voice tutor)
+google-genai>=1.33.0
+
 # Utilities
 python-dotenv>=1.0.0
 httpx>=0.27.0

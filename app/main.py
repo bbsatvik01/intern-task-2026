@@ -15,7 +15,9 @@ import time
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.feedback import get_cache_stats, get_feedback, get_usage_stats
 from app.logging_config import RequestLoggingMiddleware, setup_logging
@@ -27,6 +29,7 @@ from app.rate_limiter import RateLimitMiddleware, get_rate_limiter
 from app.async_queue import get_job_queue
 from app.async_queue import router as async_router
 from app.streaming import router as streaming_router
+from app.voice_tutor import router as voice_tutor_router
 
 # Load .env file for local development (Docker passes env vars via docker-compose)
 load_dotenv()
@@ -48,10 +51,27 @@ app.add_middleware(RequestLoggingMiddleware)
 # 2. Rate limiting (before request processing)
 app.add_middleware(RateLimitMiddleware)
 
+# --- CORS (needed for WebSocket connections in dev) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- Routers ---
 app.include_router(streaming_router)
 app.include_router(paragraph_router)
 app.include_router(async_router)
+app.include_router(voice_tutor_router)
+
+# --- Static files for voice tutor UI ---
+import os as _os
+
+_static_dir = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "static")
+if _os.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
 
 @app.get("/health")
@@ -129,3 +149,13 @@ async def feedback_endpoint(request: FeedbackRequest):
                 "elapsed_seconds": round(elapsed, 3),
             },
         )
+
+
+# --- Voice Tutor UI page ---
+@app.get("/voice-tutor")
+async def voice_tutor_page():
+    """Serve the voice tutor single-page application."""
+    return FileResponse(
+        _os.path.join(_static_dir, "index.html"),
+        media_type="text/html",
+    )
